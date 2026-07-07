@@ -1,0 +1,143 @@
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+import plotly.graph_objects as go
+import streamlit as st
+from datetime import datetime
+
+# إعدادات الواجهة السيادية
+st.set_page_config(page_title="المهدي7 - محرك التحليل المطور", layout="wide")
+st.title("🚀 نظام التحليل متعدد المتغيرات - الإصدار المطور لأصيل")
+
+# 1. دالة حساب مؤشر RSI برمجياً
+def calculate_rsi(data, window=14):
+    delta = data['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    
+    rs = gain / (loss + 1e-10)  # إضافة قيمة متناهية الصغر لتجنب القسمة على صفر
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+# 2. جلب البيانات وهندسة الميزات
+def load_and_prepare_data(ticker, period="5y"):
+    data = yf.download(ticker, period=period)
+    data.reset_index(inplace=True)
+    
+    # حساب المؤشرات الفنية كمدخلات إضافية
+    data['RSI'] = calculate_rsi(data)
+    
+    # تنظيف البيانات من القيم الفارغة الناتجة عن حساب الميزات
+    data.dropna(inplace=True)
+    data.reset_index(drop=True, inplace=True)
+    return data
+
+# 3. بناء نموذج ممتد (Multivariate LSTM) والتوقع
+def predict_multivariate(data):
+    # الميزات المعتمدة للتنبؤ (سعر الإغلاق، حجم التداول، الزخم المتمثل في RSI)
+    features = ['Close', 'Volume', 'RSI']
+    feature_data = data[features].values
+    
+    # تخصيص مجالات القياس بشكل منفصل للسعر وباقي المؤشرات
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(feature_data)
+    
+    # سكيلر خاص بسعر الإغلاق فقط لعكس التوقع لاحقاً بشكل دقيق
+    target_scaler = MinMaxScaler(feature_range=(0, 1))
+    target_scaler.fit(data[['Close']].values)
+    
+    # إعداد السلاسل الزمنية (60 يوماً كأفق زمني للذاكرة)
+    time_step = 60
+    x_train, y_train = [], []
+    
+    # استخدام 85% من البيانات للتدريب
+    train_size = int(len(scaled_data) * 0.85)
+    train_data = scaled_data[:train_size]
+    
+    for i in range(time_step, len(train_data)):
+        x_train.append(train_data[i-time_step:i])
+        y_train.append(train_data[i, 0])  # الهدف هو التنبؤ بسعر الإغلاق القادم (الميزة رقم 0)
+        
+    x_train, y_train = np.array(x_train), np.array(y_train)
+    
+    # بناء هيكلية الشبكة العميقة
+    model = Sequential([
+        LSTM(units=64, return_sequences=True, input_shape=(x_train.shape[1], x_train.shape[2])),
+        Dropout(0.2),
+        LSTM(units=64, return_sequences=False),
+        Dropout(0.2),
+        Dense(units=32),
+        Dense(units=1)
+    ])
+    
+    model.compile(optimizer='adam', loss='mean_squared_error')
+    
+    # إعداد الـ Callbacks لمنع الـ Overfitting وحفظ أفضل نسخة للأوزان
+    callbacks = [
+        EarlyStopping(monitor='loss', patience=3, restore_best_weights=True, verbose=1)
+    ]
+    
+    # تدريب النموذج بدقة أعلى (زيادة الـ Epochs مع الاعتماد على الحماية الذاتية)
+    model.fit(x_train, y_train, batch_size=32, epochs=15, callbacks=callbacks, verbose=0)
+    
+    # تجهيز مدخلات التوقع لـ (جلسة الغد) بناءً على آخر 60 يوماً من البيانات الحية
+    last_60_days = scaled_data[-time_step:]
+    x_test = np.array([last_60_days])
+    
+    # إجراء التوقع الفني
+    predicted_scaled = model.predict(x_test)
+    predicted_price = target_scaler.inverse_transform(predicted_scaled)
+    
+    return predicted_price[0][0]
+
+# --- التحكم في الواجهة الرسومية التفاعلية ---
+ticker = st.sidebar.text_input("أدخل رمز السهم أو الأصل المالي", "AAPL")
+period = st.sidebar.selectbox("المدى التاريخي للبيانات", ["2y", "5y", "10y"])
+
+if st.sidebar.button("تشغيل محرك النواة المطور"):
+    with st.spinner('جاري قراءة حركة السيولة وتحليل المؤشرات يا أصيل...'):
+        data = load_and_prepare_data(ticker, period)
+        
+        if len(data) < 100:
+            st.error("البيانات المسترجعة غير كافية لبناء السلسلة الزمنية. يرجى اختيار مدى تاريخي أكبر.")
+        else:
+            # عرض الرسم البياني للشموع اليابانية ومؤشر RSI
+            st.subheader(f"التحليل البصري المتكامل لـ {ticker}")
+            
+            fig = go.Figure(data=[go.Candlestick(x=data['Date'],
+                            open=data['Open'], high=data['High'],
+                            low=data['Low'], close=data['Close'], name="السعر")])
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # حساب الأرقام والاتجاهات المستقبلية
+            next_price = predict_multivariate(data)
+            current_price = data['Close'].iloc[-1]
+            current_rsi = data['RSI'].iloc[-1]
+            change = ((next_price - current_price) / current_price) * 100
+            
+            # لوحة البيانات الرقمية
+            col1, col2, col3 = st.columns(3)
+            col1.metric("سعر الإغلاق الأخير", f"${current_price:.2f}")
+            col2.metric("التوقع المالي المستهدف", f"${next_price:.2f}", f"{change:.2f}%")
+            col3.metric("مؤشر القوة النسبية الحالية (RSI)", f"{current_rsi:.2f}")
+            
+            # تحليل ذكي بناء على البيانات المركبة
+            st.markdown("### 🧠 تقرير النواة التحليلي")
+            
+            if change > 0 and current_rsi < 70:
+                st.success(f"تحليل المهدي7: الإشارات إيجابية ومتوافقة. التوقع يشير لصعود مدعوم بزخم مالي غير مفرط (RSI في منطقة آمنة).")
+            elif change > 0 and current_rsi >= 70:
+                st.warning(f"تحليل المهدي7: على الرغم من التوقع الصاعد، إلا أن مؤشر RSI يشير إلى منطقة تشبع شرائي ({current_rsi:.2f}). يُنصح بالحذر من انعكاس مفاجئ.")
+            elif change < 0 and current_rsi > 30:
+                st.info(f"تحليل المهدي7: هناك مؤشرات لتصحيح سعري قادم. الاتجاه يميل للهبوط المؤقت لإعادة اختبار مستويات الدعم.")
+            else:
+                st.error(f"تحليل المهدي7: السهم في منطقة تشبع بيعي حاد ({current_rsi:.2f}) مع توقع هبوطي. يفضل انتظار إشارة ارتداد واضحة قبل اتخاذ أي قرار.")
+
+# تذييل مخصص للنواة المستقلة
+st.markdown("---")
+st.caption("نظام NUCLEUS v1.0 - محرك الذكاء المالي السيادي المخصص لأصيل.")
+
